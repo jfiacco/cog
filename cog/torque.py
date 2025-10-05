@@ -60,11 +60,23 @@ class Graph:
     Creates a graph object.
     """
 
-    def __init__(self, graph_name, cog_home="cog_home", cog_path_prefix=None, enable_caching=True):
+    def __init__(
+        self, 
+        graph_name, 
+        cog_home="cog_home", 
+        cog_path_prefix=None, 
+        enable_caching=True,
+        use_hnsw=None,
+        embedding_dim=None,
+        hnsw_config=None
+    ):
         '''
         :param graph_name:
         :param cog_home: Home directory name, for most use cases use default.
         :param cog_path_prefix: sets the root directory location for Cog db. Default: '/tmp' set in cog.Config. Change this to current directory when running in an IPython environment.
+        :param use_hnsw: Whether to use HNSW indexing for embeddings. If None, uses config.HNSW_ENABLED
+        :param embedding_dim: Dimensionality of embeddings (required if use_hnsw=True)
+        :param hnsw_config: Dictionary of HNSW configuration parameters (ef, M, ef_construction, etc.)
         '''
 
         self.config = cfg
@@ -96,6 +108,61 @@ class Graph:
         self.logger.debug("predicates: " + str(self.all_predicates))
 
         self.last_visited_vertices = None
+        
+        # Initialize HNSW index if enabled
+        self.use_hnsw = use_hnsw if use_hnsw is not None else self.config.HNSW_ENABLED
+        self.hnsw_index = None
+        self.embedding_dim = embedding_dim
+        
+        if self.use_hnsw:
+            if embedding_dim is None:
+                self.logger.warning(
+                    "HNSW enabled but embedding_dim not specified. "
+                    "HNSW index will be created on first embedding insertion."
+                )
+            else:
+                self._initialize_hnsw_index(embedding_dim, hnsw_config)
+    
+    def _initialize_hnsw_index(self, dim, hnsw_config=None):
+        """Initialize the HNSW index with the given configuration."""
+        try:
+            from cog.hnsw_index import HNSWIndex
+        except ImportError:
+            self.logger.error(
+                "Failed to import HNSWIndex. HNSW functionality will be disabled. "
+                "Install hnswlib with: pip install hnswlib"
+            )
+            self.use_hnsw = False
+            return
+        
+        # Prepare HNSW configuration
+        config_params = {
+            'dim': dim,
+            'space': self.config.HNSW_SPACE,
+            'ef_construction': self.config.HNSW_EF_CONSTRUCTION,
+            'ef': self.config.HNSW_EF,
+            'M': self.config.HNSW_M,
+            'max_elements': self.config.HNSW_MAX_ELEMENTS,
+            'allow_replace_deleted': self.config.HNSW_ALLOW_REPLACE_DELETED,
+            'num_threads': self.config.HNSW_NUM_THREADS,
+        }
+        
+        # Override with user-provided config
+        if hnsw_config:
+            config_params.update(hnsw_config)
+        
+        # Set the index path
+        hnsw_dir = self.config.cog_hnsw_dir()
+        if not os.path.exists(hnsw_dir):
+            os.makedirs(hnsw_dir, exist_ok=True)
+        
+        index_path = os.path.join(hnsw_dir, f"{self.graph_name}.hnsw")
+        config_params['index_path'] = index_path
+        
+        # Create the index
+        self.hnsw_index = HNSWIndex(**config_params)
+        self.embedding_dim = dim
+        self.logger.info(f"Initialized HNSW index for graph '{self.graph_name}' with dim={dim}")
 
     def refresh(self):
         self.cog.refresh_all()
@@ -424,9 +491,12 @@ class Graph:
         self.last_visited_vertices = [v for v in self.last_visited_vertices if func(v.id)]
         return self
 
-    def sim(self, word, operator, threshold, strict=False):
+    def sim(self, word, operator, threshold, strict=False, use_hnsw=None):
         """
             Applies cosine similarity filter to the vertices and removes any vertices that do not pass the filter.
+            
+            If HNSW indexing is enabled, this method can use approximate nearest neighbor search for
+            significantly faster performance on large embedding collections.
 
             Parameters:
             -----------
@@ -438,6 +508,9 @@ class Graph:
                 The threshold value(s) to use for the comparison. If operator is "==", ">", "<", ">=", or "<=", threshold should be a float. If operator is "in", threshold should be a list of 2 floats.
             strict: bool, optional
                 If True, raises an exception if a word embedding is not found for either word. If False, assigns a similarity of 0.0 to any word embedding that is not found.
+            use_hnsw: bool, optional
+                If True, uses HNSW index for approximate search (faster). If False, uses exact search (slower but precise).
+                If None (default), automatically uses HNSW if available, otherwise falls back to exact search.
 
             Returns:
             --------
@@ -449,7 +522,29 @@ class Graph:
             ValueError:
                 If operator is not a valid comparison operator or if threshold is not a valid threshold value for the given operator.
                 If strict is True and a word embedding is not found for either word.
+                
+            Notes:
+            ------
+            When use_hnsw=True or HNSW is auto-selected, results are approximate and may differ slightly
+            from exact cosine similarity. For guaranteed exact results, set use_hnsw=False.
     """
+        # Determine whether to use HNSW
+        should_use_hnsw = use_hnsw if use_hnsw is not None else (self.use_hnsw and self.hnsw_index is not None)
+        
+        # If HNSW is requested or available, try to use it
+        if should_use_hnsw:
+            if self.hnsw_index is None:
+                self.logger.warning("HNSW requested but index not initialized. Falling back to exact search.")
+            else:
+                # Use HNSW approximate search with a reasonable k value
+                # We'll search for more neighbors than we have vertices to ensure we don't miss any
+                k = max(len(self.last_visited_vertices) * 2, 100)
+                try:
+                    return self.sim_hnsw(word, k=k, threshold=threshold, operator=operator)
+                except Exception as e:
+                    self.logger.warning(f"HNSW search failed: {e}. Falling back to exact search.")
+        
+        # Fall back to exact search
         if not isinstance(threshold, (float, int, list)):
             raise ValueError("Invalid threshold value: {}".format(threshold))
 
@@ -510,6 +605,84 @@ class Graph:
         x_norm = x_norm ** (1 / 2)
         y_norm = y_norm ** (1 / 2)
         return dot_product / (x_norm * y_norm)
+    
+    def sim_hnsw(self, word, k=10, threshold=None, operator=None):
+        """
+        Uses HNSW index for fast approximate nearest neighbor search.
+        This is significantly faster than the exact sim() method for large embedding collections.
+        
+        Parameters:
+        -----------
+        word : str
+            The query word to find similar embeddings for
+        k : int
+            Number of nearest neighbors to retrieve (default: 10)
+        threshold : float or list of 2 floats, optional
+            If provided, filters results by distance/similarity threshold
+        operator : str, optional
+            Comparison operator for threshold filtering: "==", ">", "<", ">=", "<=", or "in"
+        
+        Returns:
+        --------
+        self : GraphTraversal
+            Returns self to allow for method chaining
+        
+        Raises:
+        -------
+        ValueError:
+            If HNSW index is not enabled or not initialized
+        
+        Notes:
+        ------
+        - This method requires HNSW indexing to be enabled (use_hnsw=True)
+        - Results are approximate and may differ slightly from exact cosine similarity
+        - The distance metric depends on the HNSW space configuration (cosine, l2, or ip)
+        """
+        if not self.use_hnsw or self.hnsw_index is None:
+            raise ValueError(
+                "HNSW index is not enabled. Initialize Graph with use_hnsw=True "
+                "or use the standard sim() method for exact search."
+            )
+        
+        # Get the query embedding
+        query_embedding = self.get_embedding(word)
+        if query_embedding is None:
+            self.logger.warning(f"No embedding found for query word '{word}'")
+            self.last_visited_vertices = []
+            return self
+        
+        # Search the HNSW index
+        results = self.hnsw_index.search(word, query_embedding, k=k)
+        
+        # Filter by threshold if provided
+        if threshold is not None and operator is not None:
+            if operator == 'in':
+                if not isinstance(threshold, list) or len(threshold) != 2:
+                    raise ValueError("For 'in' operator, threshold must be a list of 2 values")
+                results = [(w, d) for w, d in results if threshold[0] <= d <= threshold[1]]
+            elif operator == '=':
+                results = [(w, d) for w, d in results if isclose(d, threshold)]
+            elif operator == '>':
+                results = [(w, d) for w, d in results if d > threshold]
+            elif operator == '<':
+                results = [(w, d) for w, d in results if d < threshold]
+            elif operator == '>=':
+                results = [(w, d) for w, d in results if d >= threshold]
+            elif operator == '<=':
+                results = [(w, d) for w, d in results if d <= threshold]
+            else:
+                raise ValueError(f"Invalid operator: {operator}")
+        
+        # Filter vertices that exist in the results
+        result_words = {w for w, _ in results}
+        filtered_vertices = [
+            v for v in self.last_visited_vertices 
+            if v.id in result_words
+        ]
+        
+        self.last_visited_vertices = filtered_vertices
+        self.logger.debug(f"HNSW search for '{word}' returned {len(filtered_vertices)} vertices")
+        return self
 
     def tag(self, tag_name):
         '''
@@ -576,12 +749,34 @@ class Graph:
 
     def put_embedding(self, word, embedding):
         """
-        Saves a word embedding.
+        Saves a word embedding. If HNSW indexing is enabled, also adds the embedding to the HNSW index.
         """
+        import numpy as np
 
         assert isinstance(word, str), "word must be a string"
+        
+        # Convert embedding to numpy array if needed
+        if not isinstance(embedding, np.ndarray):
+            embedding_array = np.array(embedding)
+        else:
+            embedding_array = embedding
+        
+        # Initialize HNSW index if needed (first embedding insertion)
+        if self.use_hnsw and self.hnsw_index is None:
+            if self.embedding_dim is None:
+                self.embedding_dim = len(embedding_array)
+            self._initialize_hnsw_index(self.embedding_dim)
+        
+        # Save to cog storage
         self.cog.use_namespace(self.graph_name).use_table(self.config.EMBEDDING_SET_TABLE_NAME).put(Record(
             str(cog_hash(word, self.config.INDEX_CAPACITY)), embedding))
+        
+        # Add to HNSW index if enabled
+        if self.use_hnsw and self.hnsw_index is not None:
+            try:
+                self.hnsw_index.add_item(word, embedding_array)
+            except Exception as e:
+                self.logger.error(f"Failed to add embedding to HNSW index: {e}")
 
     def get_embedding(self, word):
         """

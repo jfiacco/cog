@@ -17,6 +17,18 @@ GRAPH_NODE_SET_TABLE_NAME = 'TOR_NODE_SET'
 GRAPH_EDGE_SET_TABLE_NAME = 'TOR_EDGE_SET'
 EMBEDDING_SET_TABLE_NAME = 'EMBEDDING_SET'
 
+''' HNSW INDEX CONFIGURATION '''
+# HNSW index type configuration
+HNSW_ENABLED = False  # Enable HNSW indexing for embeddings by default
+HNSW_SPACE = 'cosine'  # Distance metric: 'cosine', 'l2', or 'ip' (inner product)
+HNSW_EF_CONSTRUCTION = 200  # Controls index construction speed/accuracy tradeoff
+HNSW_EF = 50  # Controls query time/accuracy tradeoff
+HNSW_M = 16  # Number of bi-directional links per element
+HNSW_MAX_ELEMENTS = 10000  # Maximum number of elements in the index
+HNSW_ALLOW_REPLACE_DELETED = False  # Allow replacing deleted elements
+HNSW_NUM_THREADS = 1  # Number of threads for index operations
+HNSW_INDEX_DIR = 'hnsw_indices'  # Directory name for HNSW indices
+
 ''' CUSTOM COG DB PATH '''
 CUSTOM_COG_DB_PATH = None
 
@@ -42,6 +54,10 @@ def cog_instance_sys_dir():
 
 def cog_views_dir():
     return "/".join([cog_db_path(), VIEWS])
+
+
+def cog_hnsw_dir():
+    return "/".join([cog_db_path(), HNSW_INDEX_DIR])
 
 
 def cog_data_dir(db_name):
