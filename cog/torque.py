@@ -12,6 +12,7 @@ import time
 import random
 from math import isclose
 import warnings
+import numpy as np
 
 NOTAG = "NOTAG"
 
@@ -595,15 +596,15 @@ class Graph:
         if x is None or y is None:
             return None
 
-        dot_product = 0
-        x_norm = 0
-        y_norm = 0
-        for i in range(len(x)):
-            dot_product += x[i] * y[i]
-            x_norm += x[i] ** 2
-            y_norm += y[i] ** 2
-        x_norm = x_norm ** (1 / 2)
-        y_norm = y_norm ** (1 / 2)
+        # Convert to numpy arrays if they aren't already
+        x = np.asarray(x)
+        y = np.asarray(y)
+        
+        # Vectorized computation using numpy
+        dot_product = np.dot(x, y)
+        x_norm = np.linalg.norm(x)
+        y_norm = np.linalg.norm(y)
+        
         return dot_product / (x_norm * y_norm)
     
     def sim_hnsw(self, word, k=10, threshold=None, operator=None):
